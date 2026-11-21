@@ -47,7 +47,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/build-push-action@v7.4.0
         with:
-          context: .
+          context: app
           file: app/Dockerfile
           platforms: linux/arm64
           push: true
