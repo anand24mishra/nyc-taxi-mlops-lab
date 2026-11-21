@@ -17,3 +17,4 @@ __pycache__/
 .idea/
 .vscode/
 infra/modules/*/.terraform.lock.hcl
+mlruns/
