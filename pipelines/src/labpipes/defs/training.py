@@ -146,7 +146,7 @@ def eval_report(
     holdout_df = artifacts.read_parquet("training/holdout")
 
     # Taxi zones borough lookup
-    zone_rows = redshift.query("select locationid as location_id, borough from ingest.taxi_zones")
+    zone_rows = redshift.query("select location_id, borough from ingest.taxi_zones")
     boroughs = {int(r["location_id"]): str(r["borough"]) for r in zone_rows if r.get("location_id") is not None}
 
     mlflow.set_tracking_uri(tracking.tracking_uri)
