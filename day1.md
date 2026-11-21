@@ -420,3 +420,158 @@ order by pickup_hour;
 - `status.yaml` workflow passed and uploaded `lab-status.json` with all 4 partitions materialized and checks verified.
 
 
+
+---
+
+## 8. Stage S2: Model Pipeline, Evaluation & Automated Promotion
+
+### A. Recall Check (Theoretical Foundations)
+
+#### 1. What is target leakage? Give one example from a taxi trip record.
+**Target leakage** occurs when information from the target variable (or information only available *after* the prediction event occurs) is inadvertently included as a training feature.
+- **Example in NYC Taxi Data:** The `trip_distance` column (actual odometer miles measured at trip completion) or `fare_amount` / `dropoff_at`. At inference time, when a rider requests a duration quote in the app *before booking*, the actual trip hasn't happened yet—the meter hasn't run and the driver may take detours. Training on actual `trip_distance` artificially deflates training and test error, but causes massive generalization failure in production where only estimated routing distance is available.
+
+#### 2. Why evaluate on the month after the training window rather than a random split of the same months?
+In real production deployments, machine learning models predict future events using models trained on historical data ($t_{train} < t_{serve}$). A **random k-fold or train-test split** leaks future seasonal trends, weather patterns, and traffic shifts into the training set, causing optimistic performance estimates that mask temporal concept drift. Evaluating on a chronologically prospective holdout month (e.g., training on `2024-01..2024-03` and evaluating on `2024-04`) accurately simulates real-world generalization to unseen future months.
+
+#### 3. MAE vs. RMSE for trip durations, when a few trips take three hours? What does each reward?
+- **Mean Absolute Error (MAE):** $\frac{1}{n}\sum |y_i - \hat{y}_i|$. Minimizing MAE mathematically estimates the **conditional median**. It penalizes errors linearly, making it robust against extreme outliers (e.g., rare 3-hour trips due to major snowstorms or highway closures).
+- **Root Mean Squared Error (RMSE):** $\sqrt{\frac{1}{n}\sum (y_i - \hat{y}_i)^2}$. Minimizing RMSE mathematically estimates the **conditional mean**. Because errors are squared, RMSE heavily penalizes large errors and gets pulled toward extreme outliers.
+- **Decision:** For taxi ride duration estimation, we optimize and gate on **MAE**. Most riders care about the typical, expected trip time rather than having every regular quote inflated by a rare multi-hour anomaly.
+
+#### 4. What does an MLflow alias give you that a version number doesn't?
+- **Decoupled Architecture:** A model version number (e.g., `v1`, `v2`, `v3`) is an immutable, monotonic integer tied to a specific model artifact. An **alias** (e.g., `@champion`, `@challenger`) is a dynamic, mutable pointer that decouples consumers (serving containers, web APIs) from the underlying training iteration.
+- **Zero-Downtime Atomic Promotion:** Serving engines can load and listen to `@champion` or `@challenger`. When a new model version is promoted, updating the alias pointer immediately points traffic to the new version without changing consumer configuration files or rebuilding application container images.
+
+---
+
+### B. Implementation Architecture & Pipeline Components
+
+```mermaid
+flowchart TD
+    subgraph Redshift ["Redshift Warehouse (staging.trip_features)"]
+        F1["trip_features (2024-01..03)"]
+        F2["trip_features (2024-04 Holdout)"]
+        D["marts.zone_distances"]
+    end
+
+    subgraph DagsterPipeline ["Dagster Platform Host (labpipes.defs.training)"]
+        TS["training_set<br/>(UNLOAD window & holdout to S3)"]
+        TM["trained_model<br/>(Fit LightGBM v2, 300 rounds)"]
+        ER["eval_report<br/>(Evaluate candidate vs. champion on holdout)"]
+        Gate{"beats_champion<br/>(Blocking Gate Check:<br/>MAE <= champ - margin<br/>p95 latency <= 20ms)"}
+        CH["challenger<br/>(Promote MLflow alias: @challenger)"]
+    end
+
+    subgraph MLflowRegistry ["MLflow Tracking & Model Registry"]
+        Exp["Experiment: /models/trip-duration"]
+        Reg["Registered Model: trip-duration"]
+        V1["Version 1 (Initial / Baseline)"]
+        V2["Version 2 (LightGBM candidate)"]
+        AliasChallenger["Alias: @challenger -> Version 2"]
+    end
+
+    F1 --> TS
+    F2 --> TS
+    D --> TS
+    TS --> TM
+    TM --> ER
+    TS --> ER
+    ER --> Gate
+    Gate -->|Pass| CH
+    TM --> Reg
+    CH --> AliasChallenger
+    Reg --> V2
+    AliasChallenger --> V2
+```
+
+1. **`feature_contract` Check (`pipelines/src/labpipes/defs/feature_check.py`)**:
+   - Blocking asset check executing against `staging.trip_features` across all partitions (`2024-01`, `2024-02`, `2024-03`, `2024-04`).
+   - Verifies column types, valid ranges (`pickup_hour` in $[0, 23]$, `pickup_dow` in $[0, 6]$, zones in $[1, 263]$), and asserts that zero forbidden post-trip leakage columns exist.
+2. **`training_set` Asset (`training.py`)**:
+   - Executes Redshift `UNLOAD` commands to export the 3-month training window (`2024-01..2024-03`, 9,452,562 rows), holdout month (`2024-04`, 3,476,146 rows), and zone distance medians to the artifact S3 bucket (`s3://lab-artifacts-<account>/training/`).
+3. **`trained_model` Asset (`training.py`)**:
+   - Fits `LightGBMModel` (300 boosting rounds, L1 objective, zone IDs treated as categoricals) with `DistanceLookup`.
+   - Logs model artifact, signature, and Python environment dependencies via `mlflow.pyfunc.log_model` and registers it to MLflow Model Registry under `trip-duration`.
+4. **`eval_report` Asset & `beats_champion` Gate (`training.py`)**:
+   - Evaluates candidate model on 3,476,146 rows of unseen 2024-04 data.
+   - Computes MAE overall and across key operational slices: `airport`, `manhattan`, `outer`, and `night`.
+   - Benchmarks single-row p95 latency across 200 random requests.
+   - Records all 7 required metadata tags in MLflow: `training_window`, `holdout_month`, `features_version`, `git_sha`, `mae_min`, `p95_latency_ms`, and `champion_mae_min`.
+   - **Blocking Gate (`beats_champion`)**: Asserts that candidate MAE $\le$ champion MAE $-$ margin ($0.0$ min) and p95 latency $\le$ 20.0 ms budget.
+5. **`challenger` Asset (`training.py`)**:
+   - Points the `@challenger` alias at the newly verified model version in MLflow.
+
+---
+
+### C. Empirical Validation & Results
+
+| Metric | Baseline (v1 Baseline / Champion) | Candidate (v2 LightGBM) | Delta / Requirement | Status |
+| :--- | :---: | :---: | :---: | :---: |
+| **Holdout Month** | `2024-04` | `2024-04` | Identical Holdout Set | Verified |
+| **Evaluation Rows** | 3,476,146 | 3,476,146 | Full Month | Verified |
+| **Overall MAE** | **3.956 min** | **3.638 min** | **-0.319 min (-19.1 sec/trip)** | **PASSED** (Gate: $\le$ Champ) |
+| **p95 Latency** | — | **3.67 ms** | Budget: $\le 20.0$ ms | **PASSED** (81.6% headroom) |
+| **MLflow Alias** | — | `@challenger` | Assigned to Version 2 | **PASSED** |
+
+#### MLflow Model Registry Tags (`trip-duration` Version 2):
+```json
+{
+  "training_window": "2024-01..2024-03",
+  "holdout_month": "2024-04",
+  "features_version": "1",
+  "git_sha": "3d1672a2b0cb1b2e195d471819f941b434fbf507",
+  "mae_min": "3.6376",
+  "p95_latency_ms": "3.67",
+  "champion_mae_min": "3.9563"
+}
+```
+
+---
+
+### D. Architectural Decision Records
+
+1. **Decision 007 (`decisions/007-notebook-vs-pipeline.md`)**:
+   - *Question:* What stays in the notebook and what moves into the pipeline?
+   - *Decision:* Exploratory data analysis, feature distribution plotting, and ad-hoc experiments stay in the notebook. Production data loading, feature validation, deterministic LightGBM training, holdout evaluation, gate checks, and MLflow model registration/alias management live strictly in the version-controlled Dagster pipeline.
+2. **Decision 008 (`decisions/008-promotion-metric-margin.md`)**:
+   - *Question:* Promotion metric, margin, and latency budget.
+   - *Decision:* Metric is Mean Absolute Error (MAE) with a margin of $0.0$ minutes (any strict improvement qualifies), and a single-row p95 latency budget of $20.0$ ms.
+3. **Decision 009 (`decisions/009-training-window.md`)**:
+   - *Question:* Training window and holdout split.
+   - *Decision:* 3-month rolling training window (`2024-01..2024-03`, 9.45M rows) evaluated on the immediate following prospective month (`2024-04`, 3.48M rows) to simulate real-world production forecasting.
+
+---
+
+### E. Cost Management & Resource Shutdown Guide
+
+In AWS Academy Learner Lab ($100 budget credit limit), shutting down or pausing high-cost services when work is completed is essential.
+
+#### High-Cost Resource Analysis:
+| Resource | Service | Running Cost | Idle / Paused Cost | Action at End of Lab |
+| :--- | :--- | :--- | :--- | :--- |
+| **Redshift Cluster (`lab`)** | Amazon Redshift (`dc2.large`) | **~$13.00 / day** (~$0.54/hr) | **$0.00 compute** (Storage only) | **PAUSE** cluster when not querying |
+| **SageMaker Notebook (`lab`)** | Amazon SageMaker | ~$0.05 / hr | $0.00 (when stopped) | **STOP** instance (or omitted via Option A) |
+| **EC2 Platform / App Hosts** | EC2 Graviton (`t4g.large`, `t4g.small`) | ~$0.10 / hr | Ephemeral lab session | Managed by lab session |
+
+#### How to Pause & Resume High-Cost Resources:
+
+1. **Pause Redshift Cluster (Saves ~$13 Overnight):**
+   ```bash
+   aws redshift pause-cluster --cluster-identifier lab
+   ```
+   *Verification:*
+   ```bash
+   aws redshift describe-clusters --cluster-identifier lab --query "Clusters[0].ClusterStatus"
+   # Output: "pausing" -> "paused"
+   ```
+
+2. **Resume Redshift Cluster (Takes ~3 minutes before runs resume):**
+   ```bash
+   aws redshift resume-cluster --cluster-identifier lab
+   ```
+
+3. **Stop SageMaker Notebook (if provisioned):**
+   ```bash
+   aws sagemaker stop-notebook-instance --notebook-instance-name lab
+   ```
