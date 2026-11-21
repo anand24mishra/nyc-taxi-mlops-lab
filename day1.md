@@ -342,7 +342,7 @@ flowchart TD
   - *Cons*: Takes ~15–30 seconds to load per month, consumes Redshift cluster disk storage.
 - **Option B (Spectrum)**: Queries Parquet files in place on S3 using external tables and a Glue data catalog.
   - *Pros*: Instant availability with zero load time, zero Redshift local disk usage.
-  - *Cons*: Slower queries (data transferred over network on every query), costs \$5 per TB scanned, requires Glue catalog setup.
+  - *Cons*: Slower queries (data transferred over network on every query), costs $5 per TB scanned, requires Glue catalog setup.
 - **Recommendation**: **COPY**. Our dataset is a fixed monthly batch; local storage provides optimal query speed for the hourly marts and subsequent feature extraction.
 
 #### Decision 2: Quality Check Severity & Thresholds
@@ -357,4 +357,66 @@ flowchart TD
 - **Option A**: `diststyle auto sortkey (tpep_pickup_datetime)` for `raw_trips`, and `sortkey (pickup_at)` for `stg_trips`.
   - *Why*: Redshift `ra3.large` in Learner Lab is a single-node cluster (multi-node distribution is inactive, so `diststyle auto` lets Redshift manage it seamlessly). Sorting on pickup timestamps accelerates time-range filtering, monthly aggregations, and feature extraction.
 - **Recommendation**: `diststyle auto sortkey (tpep_pickup_datetime)` on `raw_trips`, `sortkey (pickup_at)` on `stg_trips`.
+
+---
+
+### 8.6 S1 Execution, Ingestion & Verification Log
+
+#### 1. Pipeline Ingestion Summary
+- **Data Source**: Public bucket `nst-mlops-2026` in `us-east-1`
+- **Partitions Materialized**:
+  - `2024-01`: 2,964,624 rows (Schema check passed, duplicate check warned at 1.05%, materialization successful)
+  - `2024-02`: 3,007,526 rows (Schema check passed, materialization successful)
+  - `2024-03`: 3,582,628 rows (Schema check passed, materialization successful)
+  - `2024-04`: 3,514,289 rows (Schema check passed, materialization successful)
+- **Taxi Zones Reference**: 265 zones loaded into `ingest.taxi_zones`
+- **Zone-Hour Stats Mart**: 5,801 hourly rows computed across 260 distinct zones.
+
+#### 2. Verification Query: `marts.zone_hour_stats` (JFK Airport)
+Query executed on Redshift:
+```sql
+select zone, pickup_hour, trip_count, median_duration_min
+from marts.zone_hour_stats
+where zone = 'JFK Airport'
+order by pickup_hour;
+```
+
+**Results (All 24 hours present, matching realistic traffic curves):**
+| Pickup Hour | Zone | Trip Count | Median Duration (min) | Traffic Insight |
+| :---: | :--- | :---: | :---: | :--- |
+| **0** (12 AM) | JFK Airport | 23,714 | 31.57 | Late night arrivals, light highway traffic |
+| **1** (1 AM) | JFK Airport | 9,256 | 29.43 | Low volume |
+| **2** (2 AM) | JFK Airport | 3,264 | 25.92 | Lowest volume of the night |
+| **3** (3 AM) | JFK Airport | 2,254 | 23.50 | Off-peak clear highways |
+| **4** (4 AM) | JFK Airport | 2,397 | 22.30 | Fastest median travel time (22.3 min) |
+| **5** (5 AM) | JFK Airport | 7,895 | 27.90 | Early departures start picking up |
+| **6** (6 AM) | JFK Airport | 17,872 | 37.84 | Morning rush begins |
+| **7** (7 AM) | JFK Airport | 20,188 | 44.35 | Morning peak traffic delay |
+| **8** (8 AM) | JFK Airport | 15,698 | 41.63 | Sustained morning delay |
+| **9** (9 AM) | JFK Airport | 14,508 | 35.91 | Mid-morning recovery |
+| **10** (10 AM) | JFK Airport | 16,964 | 38.17 | Steady midday traffic |
+| **11** (11 AM) | JFK Airport | 15,681 | 42.05 | Midday traffic |
+| **12** (12 PM) | JFK Airport | 19,939 | 43.33 | Afternoon flight arrivals begin |
+| **13** (1 PM) | JFK Airport | 27,537 | 47.60 | Increasing congestion on Van Wyck / BQE |
+| **14** (2 PM) | JFK Airport | 35,221 | 50.65 | Heavy afternoon traffic |
+| **15** (3 PM) | JFK Airport | 39,718 | 51.87 | Peak congestion (slowest median trip: 51.9 min) |
+| **16** (4 PM) | JFK Airport | 44,471 | 50.65 | Highest trip volume of the day (44.5k trips) |
+| **17** (5 PM) | JFK Airport | 38,999 | 48.62 | Evening rush hour |
+| **18** (6 PM) | JFK Airport | 37,088 | 43.27 | Evening rush hour tapering |
+| **19** (7 PM) | JFK Airport | 40,338 | 37.80 | Flight arrival wave |
+| **20** (8 PM) | JFK Airport | 37,622 | 34.12 | Decreasing travel duration |
+| **21** (9 PM) | JFK Airport | 38,621 | 32.42 | Smooth evening transit |
+| **22** (10 PM) | JFK Airport | 39,769 | 32.60 | Late evening arrival wave |
+| **23** (11 PM) | JFK Airport | 37,793 | 33.93 | Final night arrival wave |
+
+#### 3. Health & Grader Status Verification
+- `scripts/health.sh`:
+  - `OK session user4756121=anand.mishra2024@nst.rishihood.edu.in`
+  - `OK app running, 34.196.103.251, runner online`
+  - `OK platform running, 50.19.131.109, runner online`
+  - `OK rds available`
+  - `OK redshift available`
+  - `OK status Dagster answered the status run 1 min ago`
+- `status.yaml` workflow passed and uploaded `lab-status.json` with all 4 partitions materialized and checks verified.
+
 
