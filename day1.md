@@ -196,4 +196,14 @@ AWS EC2 (lab-app) <── Self-Hosted Runner (Docker Compose) <─────�
 - **2026-11-21 11:43**: Implemented `scripts/register-runner.sh` (SSM-based self-hosted runner setup).
 - **2026-11-21 11:43**: Implemented `.github/workflows/ci.yaml` and `.github/workflows/pr.yaml` (Actionlint and repo workflow rules compliant).
 - **2026-11-21 11:45**: Drafted decision records `001-runner-credentials.md`, `002-image-tag-scheme.md`, `003-ingress-scope.md`.
-- **2026-11-21 11:46**: `make check` verified 100% green.
+- **2026-11-21 11:51**: User approved `terraform apply` -> 28 resources successfully provisioned on AWS in `us-east-1` (3 EC2 Graviton hosts, RDS Postgres instance, artifact S3 bucket, secret containers, security groups).
+- **2026-11-21 11:58**: Registered self-hosted runner `lab-app` on EC2 (`i-071591009d55bdf07`) via SSM with latest runner `v2.338.2`. Runner reported `online`.
+- **2026-11-21 12:02**: GitHub Actions `ci.yaml` ran end-to-end:
+  - `check`: green (1m 57s)
+  - `image`: built `linux/arm64` container image and pushed to GHCR (31s)
+  - `deploy`: deployed image on `lab-app` self-hosted EC2 runner with Traefik + FastAPI (27s)
+- **2026-11-21 12:06**: Live HTTP verification on public IP `34.196.103.251`:
+  - `GET /version` -> `200 OK` (returns git SHA `5527a2f...` and image tag `sha-5527a2f`)
+  - `POST /predict` (valid) -> `200 OK` (returns static median quote `12.25` min)
+  - `POST /predict` (invalid zone `9999`) -> `422 Unprocessable Entity`
+- **2026-11-21 12:07**: Local `make check` verified 100% green. Stage S0 is **COMPLETE**!
